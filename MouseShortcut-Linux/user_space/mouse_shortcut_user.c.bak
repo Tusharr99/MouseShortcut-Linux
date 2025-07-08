@@ -1,0 +1,179 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <linux/netlink.h>
+#include <unistd.h>
+#include <time.h>
+#include <errno.h>
+#include <signal.h>
+
+#define NETLINK_USER 29
+#define MAX_PAYLOAD 64
+
+// State for tracking button presses
+static int button_volume_up = 276; // Default: Button 276 for volume up
+static int button_volume_down = 275; // Default: Button 275 for volume down
+static int button_up_pressed = 0;
+static int button_down_pressed = 0;
+static time_t press_start_time = 0;
+static struct nlmsghdr *nlh = NULL;
+static int sock_fd = -1;
+
+static void cleanup(int signum)
+{
+    if (nlh)
+        free(nlh);
+    if (sock_fd >= 0)
+        close(sock_fd);
+    printf("Cleaned up and exiting\n");
+    exit(0);
+}
+
+void execute_shortcut(const char *message)
+{
+    char button_str[32];
+
+    printf("Received message: %s\n", message);
+
+    // Volume control
+    snprintf(button_str, sizeof(button_str), "Button %d pressed", button_volume_up);
+    if (strstr(message, button_str)) {
+        system("amixer -q set Master 5%+");
+        printf("Triggered shortcut: Increase volume\n");
+        button_up_pressed = 1;
+    } else {
+        snprintf(button_str, sizeof(button_str), "Button %d released", button_volume_up);
+        if (strstr(message, button_str)) {
+            button_up_pressed = 0;
+            press_start_time = 0;
+            printf("Button %d released\n", button_volume_up);
+        }
+    }
+
+    snprintf(button_str, sizeof(button_str), "Button %d pressed", button_volume_down);
+    if (strstr(message, button_str)) {
+        system("amixer -q set Master 5%-");
+        printf("Triggered shortcut: Decrease volume\n");
+        button_down_pressed = 1;
+    } else {
+        snprintf(button_str, sizeof(button_str), "Button %d released", button_volume_down);
+        if (strstr(message, button_str)) {
+            button_down_pressed = 0;
+            press_start_time = 0;
+            printf("Button %d released\n", button_volume_down);
+        }
+    }
+
+    // Check for both buttons pressed
+    if (button_up_pressed && button_down_pressed) {
+        if (press_start_time == 0) {
+            press_start_time = time(NULL);
+            printf("Both buttons pressed, starting timer\n");
+        } else {
+            time_t current_time = time(NULL);
+            if (current_time - press_start_time >= 3) {
+                system("scrot ~/Pictures/screenshot-%Y%m%d-%H%M%S.png");
+                printf("Triggered shortcut: Screenshot taken\n");
+                press_start_time = 0;
+                button_up_pressed = 0;
+                button_down_pressed = 0;
+            }
+        }
+    }
+}
+
+int main(int argc, char *argv[])
+{
+    struct sockaddr_nl src_addr, dest_addr;
+    struct iovec iov;
+    struct msghdr msg;
+    struct timeval tv = { .tv_sec = 5 }; // 5-second timeout
+
+    // Parse command-line arguments for button codes
+    if (argc > 1)
+        button_volume_up = atoi(argv[1]);
+    if (argc > 2)
+        button_volume_down = atoi(argv[2]);
+    printf("Using button codes: volume_up=%d, volume_down=%d\n",
+           button_volume_up, button_volume_down);
+
+    // Set up signal handler for cleanup
+    signal(SIGINT, cleanup);
+    signal(SIGTERM, cleanup);
+
+    // Create Netlink socket
+    sock_fd = socket(PF_NETLINK, SOCK_RAW, NETLINK_USER);
+    if (sock_fd < 0) {
+        fprintf(stderr, "Failed to create socket: %s (errno=%d)\n", strerror(errno), errno);
+        return -1;
+    }
+
+    // Set receive timeout
+    if (setsockopt(sock_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
+        fprintf(stderr, "Failed to set socket timeout: %s\n", strerror(errno));
+        close(sock_fd);
+        return -1;
+    }
+
+    // Bind socket
+    memset(&src_addr, 0, sizeof(src_addr));
+    src_addr.nl_family = AF_NETLINK;
+    src_addr.nl_pid = getpid();
+
+    if (bind(sock_fd, (struct sockaddr *)&src_addr, sizeof(src_addr)) < 0) {
+        fprintf(stderr, "Failed to bind socket: %s (errno=%d)\n", strerror(errno), errno);
+        close(sock_fd);
+        return -1;
+    }
+
+    // Allocate message buffer
+    nlh = (struct nlmsghdr *)malloc(NLMSG_SPACE(MAX_PAYLOAD));
+    if (!nlh) {
+        fprintf(stderr, "Failed to allocate message buffer: %s\n", strerror(errno));
+        close(sock_fd);
+        return -1;
+    }
+
+    // Prepare message
+    memset(nlh, 0, NLMSG_SPACE(MAX_PAYLOAD));
+    nlh->nlmsg_pid = getpid();
+    iov.iov_base = (void *)nlh;
+    iov.iov_len = NLMSG_SPACE(MAX_PAYLOAD);
+    msg.msg_name = (void *)&dest_addr;
+    msg.msg_namelen = sizeof(dest_addr);
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+
+    // Send registration message
+    strcpy(NLMSG_DATA(nlh), "REGISTER");
+    if (sendmsg(sock_fd, &msg, 0) < 0) {
+        fprintf(stderr, "Failed to send registration message: %s\n", strerror(errno));
+        cleanup(0);
+    }
+    printf("Sent registration message to kernel\n");
+
+    printf("Waiting for mouse events...\n");
+
+    // Receive loop
+    while (1) {
+        ssize_t recv_len = recvmsg(sock_fd, &msg, 0);
+        if (recv_len < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                printf("Receive timeout, continuing...\n");
+                continue;
+            }
+            fprintf(stderr, "Failed to receive message: %s (errno=%d)\n", strerror(errno), errno);
+            continue;
+        }
+        if (recv_len < NLMSG_HDRLEN || !NLMSG_OK(nlh, recv_len)) {
+            fprintf(stderr, "Invalid message received\n");
+            continue;
+        }
+        char *data = NLMSG_DATA(nlh);
+        execute_shortcut(data);
+    }
+
+    cleanup(0);
+    return 0;
+}
